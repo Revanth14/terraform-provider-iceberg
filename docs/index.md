@@ -197,6 +197,7 @@ carry duplicate credentials.
 
 - [iceberg_namespace](data-sources/namespace.md) — Read metadata for an existing namespace from the catalog.
 - [iceberg_table](data-sources/table.md) — Read metadata for an existing table from the catalog.
+- [iceberg_tables](data-sources/tables.md) — List table names in a namespace from the catalog.
 
 ## Resources
 
