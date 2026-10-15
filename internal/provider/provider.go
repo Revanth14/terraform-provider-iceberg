@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
@@ -27,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/processcreds"
+	"github.com/hashicorp/terraform-plugin-framework-validators/providervalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -38,7 +40,10 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 )
 
-var _ provider.Provider = &icebergProvider{}
+var (
+	_ provider.Provider                     = &icebergProvider{}
+	_ provider.ProviderWithConfigValidators = &icebergProvider{}
+)
 
 // New is a helper function to simplify provider server and testing implementation.
 func New() func() provider.Provider {
@@ -55,6 +60,18 @@ type icebergProvider struct {
 	warehouse   string
 	headers     map[string]string
 	sigv4       *sigv4Config
+	oauth2      *oauth2Config
+	// authUnknown is set while planning when auth depends on values known only after apply.
+	authUnknown bool
+}
+
+// oauth2Config holds the OAuth2 client credentials settings passed to iceberg-go.
+type oauth2Config struct {
+	credential string
+	serverURI  *url.URL
+	scope      string
+	audience   string
+	resource   string
 }
 
 // sigv4Config holds the settings for signing requests with AWS SigV4.
@@ -64,8 +81,6 @@ type sigv4Config struct {
 	accessKeyID     string
 	secretAccessKey string
 	sessionToken    string
-	// unknown is set while planning when auth depends on values known only after apply.
-	unknown bool
 }
 
 // icebergProviderModel maps provider schema data to a Go type.
@@ -79,7 +94,8 @@ type icebergProviderModel struct {
 }
 
 type icebergAuthModel struct {
-	SigV4 types.Object `tfsdk:"sigv4"`
+	SigV4  types.Object `tfsdk:"sigv4"`
+	OAuth2 types.Object `tfsdk:"oauth2"`
 }
 
 type icebergSigV4Model struct {
@@ -88,6 +104,14 @@ type icebergSigV4Model struct {
 	AccessKeyID     types.String `tfsdk:"access_key_id"`
 	SecretAccessKey types.String `tfsdk:"secret_access_key"`
 	SessionToken    types.String `tfsdk:"session_token"`
+}
+
+type icebergOAuth2Model struct {
+	Credential types.String `tfsdk:"credential"`
+	ServerURI  types.String `tfsdk:"server_uri"`
+	Scope      types.String `tfsdk:"scope"`
+	Audience   types.String `tfsdk:"audience"`
+	Resource   types.String `tfsdk:"resource"`
 }
 
 // Metadata returns the provider type name.
@@ -118,7 +142,7 @@ func (p *icebergProvider) Schema(_ context.Context, _ provider.SchemaRequest, re
 				Optional:    true,
 			},
 			"headers": schema.MapAttribute{
-				Description: "The headers to use for authentication.",
+				Description: "The headers to use for authentication. With `auth.oauth2`, an `Authorization` entry is not sent, and the other headers are also sent to the OAuth2 token endpoint.",
 				Optional:    true,
 				Sensitive:   true,
 				ElementType: types.StringType,
@@ -171,9 +195,54 @@ func (p *icebergProvider) Schema(_ context.Context, _ provider.SchemaRequest, re
 							},
 						},
 					},
+					"oauth2": schema.SingleNestedAttribute{
+						Description: "Authenticate with the OAuth2 client credentials flow. Tokens are fetched and refreshed automatically.",
+						Optional:    true,
+						Attributes: map[string]schema.Attribute{
+							"credential": schema.StringAttribute{
+								Description: "The client credential, formatted as `client_id:client_secret`. A value without a colon is used as the client secret with an empty client ID.",
+								Required:    true,
+								Sensitive:   true,
+								Validators: []validator.String{
+									stringvalidator.LengthAtLeast(1),
+								},
+							},
+							"server_uri": schema.StringAttribute{
+								Description: "The OAuth2 token endpoint. Defaults to `{catalog_uri}/v1/oauth/tokens`.",
+								Optional:    true,
+							},
+							"scope": schema.StringAttribute{
+								Description: "The scope to request. Defaults to `catalog`.",
+								Optional:    true,
+							},
+							"audience": schema.StringAttribute{
+								Description: "The audience to request.",
+								Optional:    true,
+							},
+							"resource": schema.StringAttribute{
+								Description: "The resource to request.",
+								Optional:    true,
+							},
+						},
+					},
 				},
 			},
 		},
+	}
+}
+
+// ConfigValidators returns validators that apply across provider attributes.
+func (p *icebergProvider) ConfigValidators(_ context.Context) []provider.ConfigValidator {
+	return []provider.ConfigValidator{
+		providervalidator.Conflicting(
+			path.MatchRoot("token"),
+			path.MatchRoot("auth").AtName("oauth2"),
+		),
+		// SigV4 replaces the Authorization header that carries the OAuth2 token.
+		providervalidator.Conflicting(
+			path.MatchRoot("auth").AtName("sigv4"),
+			path.MatchRoot("auth").AtName("oauth2"),
+		),
 	}
 }
 
@@ -230,6 +299,8 @@ func (p *icebergProvider) Configure(ctx context.Context, req provider.ConfigureR
 	}
 
 	p.sigv4 = nil
+	p.oauth2 = nil
+	p.authUnknown = false
 	if !data.Auth.IsNull() {
 		authValue, err := data.Auth.ToTerraformValue(ctx)
 		if err != nil {
@@ -239,8 +310,8 @@ func (p *icebergProvider) Configure(ctx context.Context, req provider.ConfigureR
 		}
 
 		if !authValue.IsFullyKnown() {
-			// Guessing any part would sign with the wrong scope or identity.
-			p.sigv4 = &sigv4Config{unknown: true}
+			// Guessing any part would authenticate with the wrong scope or identity.
+			p.authUnknown = true
 		} else {
 			var auth icebergAuthModel
 			resp.Diagnostics.Append(data.Auth.As(ctx, &auth, basetypes.ObjectAsOptions{})...)
@@ -263,6 +334,13 @@ func (p *icebergProvider) Configure(ctx context.Context, req provider.ConfigureR
 					sessionToken:    m.SessionToken.ValueString(),
 				}
 			}
+
+			if !auth.OAuth2.IsNull() {
+				p.oauth2 = configureOAuth2(ctx, auth.OAuth2, resp)
+				if resp.Diagnostics.HasError() {
+					return
+				}
+			}
 		}
 	}
 
@@ -270,10 +348,61 @@ func (p *icebergProvider) Configure(ctx context.Context, req provider.ConfigureR
 	resp.ResourceData = p
 }
 
+func configureOAuth2(ctx context.Context, obj types.Object, resp *provider.ConfigureResponse) *oauth2Config {
+	var m icebergOAuth2Model
+	resp.Diagnostics.Append(obj.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+	if resp.Diagnostics.HasError() {
+		return nil
+	}
+
+	cfg := &oauth2Config{
+		credential: m.Credential.ValueString(),
+		scope:      m.Scope.ValueString(),
+		audience:   m.Audience.ValueString(),
+		resource:   m.Resource.ValueString(),
+	}
+
+	if serverURI := m.ServerURI.ValueString(); serverURI != "" {
+		u, err := url.Parse(serverURI)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			resp.Diagnostics.AddAttributeError(
+				path.Root("auth").AtName("oauth2").AtName("server_uri"),
+				"Invalid OAuth2 Server URI",
+				"server_uri must be an absolute URL. Got: "+serverURI,
+			)
+
+			return nil
+		}
+		cfg.serverURI = u
+	}
+
+	return cfg
+}
+
 func (p *icebergProvider) NewCatalog(ctx context.Context) (catalog.Catalog, error) {
+	if p.authUnknown {
+		return nil, errors.New("auth is not known until apply, so requests cannot be authenticated yet")
+	}
+
 	opts := make([]rest.Option, 0)
 	if p.token != "" && p.sigv4 == nil {
 		opts = append(opts, rest.WithOAuthToken(p.token))
+	}
+
+	if o := p.oauth2; o != nil {
+		opts = append(opts, rest.WithCredential(o.credential))
+		if o.serverURI != nil {
+			opts = append(opts, rest.WithAuthURI(o.serverURI))
+		}
+		if o.scope != "" {
+			opts = append(opts, rest.WithScope(o.scope))
+		}
+		if o.audience != "" {
+			opts = append(opts, rest.WithAudience(o.audience))
+		}
+		if o.resource != "" {
+			opts = append(opts, rest.WithResource(o.resource))
+		}
 	}
 
 	if p.warehouse != "" {
@@ -281,7 +410,16 @@ func (p *icebergProvider) NewCatalog(ctx context.Context) (catalog.Catalog, erro
 	}
 
 	if p.sigv4 == nil {
-		opts = append(opts, rest.WithCustomTransport(&headerRoundTripper{headers: p.headers}))
+		headers := p.headers
+		if p.oauth2 != nil {
+			headers = withoutAuthorization(headers)
+		}
+		if len(headers) > 0 {
+			opts = append(opts, rest.WithHeaders(headers))
+		}
+		// Without a transport, iceberg-go builds one per catalog and never
+		// closes its idle connections.
+		opts = append(opts, rest.WithCustomTransport(http.DefaultTransport))
 	} else {
 		sigv4Opts, err := p.sigv4.options(ctx, p.token, p.headers)
 		if err != nil {
@@ -291,6 +429,19 @@ func (p *icebergProvider) NewCatalog(ctx context.Context) (catalog.Catalog, erro
 	}
 
 	return rest.NewCatalog(ctx, p.catalogType, p.catalogURI, opts...)
+}
+
+// withoutAuthorization drops the Authorization header, which the OAuth2 token
+// replaces and which must not reach a separate token endpoint.
+func withoutAuthorization(headers map[string]string) map[string]string {
+	kept := make(map[string]string, len(headers))
+	for name, value := range headers {
+		if http.CanonicalHeaderKey(name) != "Authorization" {
+			kept[name] = value
+		}
+	}
+
+	return kept
 }
 
 // options returns the iceberg-go options that sign requests with SigV4.
@@ -329,9 +480,6 @@ func (s *sigv4Config) options(ctx context.Context, token string, headers map[str
 // replace the AWS credential chain. The region falls back to the AWS
 // environment, and credential providers that call STS get it as well.
 func (s *sigv4Config) awsConfig(ctx context.Context) (aws.Config, error) {
-	if s.unknown {
-		return aws.Config{}, errors.New("auth.sigv4 is not known until apply, so requests cannot be signed yet")
-	}
 	static := s.accessKeyID != "" && s.secretAccessKey != ""
 	if !static && (s.accessKeyID != "" || s.secretAccessKey != "" || s.sessionToken != "") {
 		// Never fall back to the AWS credential chain when keys were configured.
@@ -375,18 +523,6 @@ func (p processOutputHidden) Retrieve(ctx context.Context) (aws.Credentials, err
 	}
 
 	return creds, err
-}
-
-type headerRoundTripper struct {
-	headers map[string]string
-}
-
-func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	for k, v := range h.headers {
-		req.Header.Add(k, v)
-	}
-
-	return http.DefaultTransport.RoundTrip(req)
 }
 
 // DataSources defines the data sources implemented in the provider.

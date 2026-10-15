@@ -204,6 +204,35 @@ carry duplicate credentials.
 - [iceberg_namespace](resources/namespace.md) — Manage a catalog namespace.
 - [iceberg_table](resources/table.md) — Manage an Iceberg table.
 
+## Example Usage
+
+Authenticate with a static bearer token:
+
+```terraform
+provider "iceberg" {
+  catalog_uri = "https://catalog.example.com"
+  token       = var.catalog_token
+}
+```
+
+Authenticate with the OAuth2 client credentials flow. The provider fetches a
+token from the token endpoint and refreshes it automatically:
+
+```terraform
+provider "iceberg" {
+  catalog_uri = "https://catalog.example.com"
+
+  auth = {
+    oauth2 = {
+      credential = "${var.client_id}:${var.client_secret}"
+      scope      = "PRINCIPAL_ROLE:ALL"
+    }
+  }
+}
+```
+
+`auth.oauth2` cannot be set together with `token` or `auth.sigv4`.
+
 ## Schema
 
 ### Required
@@ -213,7 +242,7 @@ carry duplicate credentials.
 ### Optional
 
 - `auth` (Attributes) Authentication settings for the Iceberg REST catalog. (see [below for nested schema](#nestedatt--auth))
-- `headers` (Map of String, Sensitive) The headers to use for authentication.
+- `headers` (Map of String, Sensitive) The headers to use for authentication. With `auth.oauth2`, an `Authorization` entry is not sent, and the other headers are also sent to the OAuth2 token endpoint.
 - `token` (String, Sensitive) The token to use for authentication.
 - `type` (String) The type of catalog. Use 'rest' for a plain REST catalog.
 - `warehouse` (String) The warehouse to use for the Iceberg REST catalog. This will be passed as `warehouse` property in the catalog properties.
@@ -223,7 +252,22 @@ carry duplicate credentials.
 
 Optional:
 
+- `oauth2` (Attributes) Authenticate with the OAuth2 client credentials flow. Tokens are fetched and refreshed automatically. (see [below for nested schema](#nestedatt--auth--oauth2))
 - `sigv4` (Attributes) Sign requests with AWS Signature Version 4, as catalogs such as AWS Glue require. Setting this attribute enables signing. (see [below for nested schema](#nestedatt--auth--sigv4))
+
+<a id="nestedatt--auth--oauth2"></a>
+### Nested Schema for `auth.oauth2`
+
+Required:
+
+- `credential` (String, Sensitive) The client credential, formatted as `client_id:client_secret`. A value without a colon is used as the client secret with an empty client ID.
+
+Optional:
+
+- `audience` (String) The audience to request.
+- `resource` (String) The resource to request.
+- `scope` (String) The scope to request. Defaults to `catalog`.
+- `server_uri` (String) The OAuth2 token endpoint. Defaults to `{catalog_uri}/v1/oauth/tokens`.
 
 <a id="nestedatt--auth--sigv4"></a>
 ### Nested Schema for `auth.sigv4`
